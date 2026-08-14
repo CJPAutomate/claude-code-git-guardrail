@@ -121,3 +121,7 @@ what was learned. Always exits `0`; a hook must never break the session.
 
 Written with [Claude Code](https://claude.com/claude-code), which is also what it constrains.
 Both hooks are dependency-free Node, no `jq`, no packages.
+
+## License
+
+[MIT](LICENSE) — use it, fork it, adapt the exemption to your own paths.
