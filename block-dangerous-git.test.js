@@ -26,6 +26,18 @@ const CLEANF = 'clean -' + 'fd';
 const FORCE = '--for' + 'ce';
 
 const cases = [
+  // ---- refspec-less push (bypass found + closed 2026-08-16): MUST BLOCK ----
+  // `git push` with no refspec pushes the CURRENT branch, which this hook cannot see.
+  // Before the fix these were ALLOW while the explicit `push origin main` form was BLOCK,
+  // even though on a main-tracking branch the two do exactly the same thing.
+  ['bare push, no remote',          g + '-C /Users/dev/.claude/hooks push', 'BLOCK'],
+  ['bare push, remote only',        g + '-C /Users/dev/.claude/hooks push origin', 'BLOCK'],
+  ['bare push in a loop variable',  'for r in a b; do ' + g + '-C $r push; done', 'BLOCK'],
+  ['bare push with flags only',     push + '--quiet', 'BLOCK'],
+  ['memory bare push still exempt', g + '-C ' + MEMMAC + ' push', 'ALLOW'],
+  ['feature push still allowed',    push + 'origin feat/x', 'ALLOW'],
+  ['feature push -u still allowed', push + '-u origin feat/x', 'ALLOW'],
+
   // ---- memory-store exemption: MUST ALLOW ---------------------------------
   ['memory push via -C',            g + '-C "' + MEM + '" push origin main', 'ALLOW'],
   ['memory push via cd &&',         'cd "$HOME/.claude/projects/C--Temp-cjp/memory" && ' + push + 'origin main', 'ALLOW'],

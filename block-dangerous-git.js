@@ -130,6 +130,18 @@ process.stdin.on('end', () => {
     if (/(^| |[:/])(main|master)( |:|$)/.test(args) && !memoryExempt) {
       block('pushing to main/master directly is not allowed — open a PR (main is protected by the required-check ruleset).');
     }
+
+    // A push with NO refspec targets the CURRENT branch, which this hook cannot see — it gets
+    // neither the cwd nor the checked-out ref. Matching only the literal token `main` therefore
+    // left a real bypass (found 2026-08-16): `git -C <repo> push` did exactly what the blocked
+    // `git -C <repo> push origin main` does, and sailed through. Fail safe: require the branch
+    // to be named so it can be judged. Positional args = tokens that are not flags; 0 means
+    // `git push`, 1 means `git push origin` — both resolve to the upstream of the current branch.
+    const positionals = args.trim().split(/\s+/).filter((t) => t && !t.startsWith('-'));
+    if (positionals.length < 2 && !memoryExempt) {
+      block('a `git push` with no explicit refspec pushes the CURRENT branch, and this hook cannot ' +
+        'see which branch that is — name it (`git push origin <branch>`) so the rule can check it.');
+    }
   }
 
   process.exit(0);
