@@ -32,21 +32,95 @@
  * but note a parse failure means "fail open", so the script is dependency-free
  * (no jq) and defensive. jq is NOT installed on this machine; do not reintroduce it.
  *
+ * ---------------------------------------------------------------------------
+ * TRANSPORT COVERAGE (2026-08-16) — this hook used to guard ONE transport.
+ *
+ * It was registered under `matcher: "Bash"` and read `.tool_input.command`, a
+ * field only Bash calls carry. So a forge MCP server could perform the very
+ * operations below — delete the main ref, force-update it, commit straight onto
+ * main via the contents API — and the guard was never even invoked. Measured
+ * before the fix: 9 of 9 such calls sailed through.
+ *
+ * Now: Bash keeps its exact previous behaviour, and a call to a git-FORGE MCP
+ * server is FAIL-CLOSED — anything that is not a recognised read-only tool is
+ * blocked, because this hook cannot reason about an argument shape it has never
+ * seen. Do forge writes through `gh`/`git` in Bash, where these rules apply.
+ *
+ * ⚠️ STATED RESIDUALS — this is detection with known edges, not a sealed door:
+ *   • A forge exposed under an OPAQUE server id (claude.ai connectors are named
+ *     by uuid, e.g. mcp__230416e2-…__) using generic tool names is NOT detected
+ *     by the server-name axis. When adding any forge MCP, add its server id to
+ *     FORGE_SERVER below. The high-specificity FORGE_OP list is the backstop.
+ *   • A total stdin parse failure still fails OPEN (see above). Deliberate: we
+ *     cannot know whether an unparseable call is even guarded, and blocking all
+ *     traffic on malformed input would brick the session.
+ *   • FORGE_OP is deliberately high-specificity so it does not collide with
+ *     non-forge servers that legitimately expose delete_branch / reset_branch /
+ *     merge_branch (Supabase does). Broadening it would cry wolf, and a guard
+ *     that cries wolf gets switched off.
+ *
  * Emergency bypass for the human: remove/disable this hook in
  * ~/.claude/settings.json, or run the command yourself.
  */
 'use strict';
 
+// --- Transport classification --------------------------------------------
+// DUPLICATED VERBATIM in codex-review-guard.js ON PURPOSE: a guardrail stays
+// self-contained, so one broken shared file cannot disarm both guards at once
+// (and a failed `require` would exit non-2 = allow, i.e. fail open). The test
+// suites assert the two copies have not drifted.
+// NB: an absent tool_name falls back to the legacy Bash-only contract, which
+// keeps every pre-existing fixture (written before the field existed) valid.
+// Everything from `const FORGE_SERVER` to the close of classifyTool is compared
+// BYTE-FOR-BYTE against the copy in codex-review-guard.js by the git suite, so
+// keep commentary OUT of that span — the assertion is the only thing that makes
+// the deliberate duplication safe, and a stray comment would fail it for no
+// behavioural reason (it did exactly that on the first run, which is how we
+// know the gate can go red).
+const FORGE_SERVER = /(?:^|[-_])(?:github|gitlab|gitea|forgejo|bitbucket|sourcehut|azure-?devops)(?:$|[-_])/i;
+const FORGE_OP = /^(?:merge_pull_request|merge_pr|delete_ref|update_ref|push_files|create_or_update_file|delete_repository|delete_repo)$/i;
+const READ_ONLY = /^(?:get|list|search|view|read|describe|fetch)(?:_|$)/i;
+
+function classifyTool(toolName) {
+  if (!toolName || toolName === 'Bash') return { kind: 'bash' };
+  const parts = String(toolName).split('__');
+  if (parts[0] !== 'mcp' || parts.length < 3) return { kind: 'other' };
+  const server = parts[1];
+  const tool = parts.slice(2).join('__');
+  if (FORGE_SERVER.test(server) || FORGE_OP.test(tool)) {
+    return { kind: READ_ONLY.test(tool) ? 'forge-read' : 'forge-write', server, tool };
+  }
+  return { kind: 'other' };
+}
+
 let data = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (c) => (data += c));
 process.stdin.on('end', () => {
-  let cmd = '';
+  let evt = {};
   try {
-    cmd = ((JSON.parse(data) || {}).tool_input || {}).command || '';
+    evt = JSON.parse(data) || {};
   } catch (_) {
-    cmd = '';
+    evt = {};
   }
+
+  const t = classifyTool(evt.tool_name);
+  if (t.kind === 'forge-write') {
+    process.stderr.write(
+      'BLOCKED by git guardrail: `' + evt.tool_name + '` is a write on a git-forge MCP server, ' +
+      'and this guard cannot verify what it targets.\n' +
+      'These rules (no force-push, no push to main/master, no ref or repo deletion) are enforced ' +
+      'against git/gh run in Bash. A forge MCP is a SECOND transport that reaches the same ' +
+      'operations, so it is refused rather than waved through.\n' +
+      'Do it via Bash (`gh pr ...`, `git push origin <branch>`) where the rules apply, or ask the ' +
+      'user to run it. If this tool is genuinely read-only, it belongs on the READ_ONLY allow-list ' +
+      'in this hook — a deliberate edit, not a bypass.\n'
+    );
+    process.exit(2);
+  }
+  if (t.kind !== 'bash') process.exit(0); // forge-read, or a tool that cannot do guarded work
+
+  const cmd = (evt.tool_input || {}).command || '';
   if (!cmd || typeof cmd !== 'string') process.exit(0);
 
   // Collapse whitespace for matching; keep the original for the message.

@@ -96,15 +96,116 @@ const cases = [
   ['branch -d merged',              g + 'branch -d feat/merged', 'ALLOW'],
 ];
 
+// ---- TRANSPORT COVERAGE (added 2026-08-16) ------------------------------
+// Before this, the hook was invoked only for Bash and read .tool_input.command,
+// a field only Bash carries. A forge MCP server reached the SAME operations and
+// was never seen: a standalone negative control measured 9 of 9 sailing through.
+// These cases keep that closed. Shape: [label, tool_name, tool_input, want].
+const mcpCases = [
+  // --- forge WRITES: fail closed -----------------------------------------
+  ['forge: delete the main ref',   'mcp__github__delete_ref',  { ref: 'heads/main' }, 'BLOCK'],
+  ['forge: force-update a ref',    'mcp__github__update_ref',  { ref: 'heads/main', force: true }, 'BLOCK'],
+  ['forge: commit onto main',      'mcp__github__create_or_update_file', { branch: 'main' }, 'BLOCK'],
+  ['forge: push_files to main',    'mcp__github__push_files',  { branch: 'main' }, 'BLOCK'],
+  ['forge: delete a repository',   'mcp__github__delete_repository', {}, 'BLOCK'],
+  ['forge: create a PR (write)',   'mcp__github__create_pull_request', {}, 'BLOCK'],
+  ['forge: unknown future tool',   'mcp__github__some_future_tool', { unexpected: true }, 'BLOCK'],
+  ['forge: unrecognised shape',    'mcp__github__delete_ref',  null, 'BLOCK'],
+  ['forge: gitlab server too',     'mcp__gitlab__delete_ref',  {}, 'BLOCK'],
+  ['forge: plugin-namespaced',     'mcp__plugin_acme_github__delete_ref', {}, 'BLOCK'],
+  // FORGE_OP backstop: an OPAQUE (uuid) server is still caught when the tool
+  // name is high-specificity — the only axis available when the server is anonymous.
+  ['forge: uuid server, known op', 'mcp__230416e2-71c4-4361-abef-ca4cc656e5a8__merge_pull_request', {}, 'BLOCK'],
+
+  // --- forge READS: allowed ----------------------------------------------
+  ['forge read: get file',         'mcp__github__get_file_contents', {}, 'ALLOW'],
+  ['forge read: list PRs',         'mcp__github__list_pull_requests', {}, 'ALLOW'],
+  ['forge read: search code',      'mcp__github__search_code', {}, 'ALLOW'],
+
+  // --- NOT a forge: must stay allowed, or the guard cries wolf ------------
+  // Supabase genuinely exposes delete_branch / reset_branch / merge_branch on
+  // DATABASE branches. FORGE_OP is deliberately high-specificity so these pass;
+  // broadening it to a bare /delete|merge|reset/ would block ordinary work.
+  ['supabase delete_branch',       'mcp__49a2518e-ab12-453f-bbab-55195cf38f35__delete_branch', {}, 'ALLOW'],
+  ['supabase reset_branch',        'mcp__49a2518e-ab12-453f-bbab-55195cf38f35__reset_branch', {}, 'ALLOW'],
+  ['supabase merge_branch',        'mcp__49a2518e-ab12-453f-bbab-55195cf38f35__merge_branch', {}, 'ALLOW'],
+  ['drive trash_file',             'mcp__b9ab8664-d88f-4232-8ccc-38d11791f63b__trash_file', {}, 'ALLOW'],
+  ['playwright click',             'mcp__playwright__browser_click', {}, 'ALLOW'],
+  // ⚠️ STATED RESIDUAL, asserted so it is on the record rather than a surprise:
+  // a forge behind an OPAQUE server id using a GENERIC tool name is NOT detected.
+  // Mitigation is registration — add the server id to FORGE_SERVER in both hooks.
+  ['RESIDUAL: uuid forge, generic name', 'mcp__230416e2-71c4-4361-abef-ca4cc656e5a8__delete_branch', {}, 'ALLOW'],
+
+  // --- built-in non-Bash tools: untouched ---------------------------------
+  ['builtin Read',                 'Read',  { file_path: '/x' }, 'ALLOW'],
+  ['builtin Edit',                 'Edit',  { file_path: '/x' }, 'ALLOW'],
+  ['builtin Write',                'Write', { file_path: '/x' }, 'ALLOW'],
+];
+
+// Bash cases run twice: once WITHOUT tool_name (the legacy fixture shape, which
+// must keep working) and once WITH tool_name:"Bash" (the real payload — the docs
+// confirm PreToolUse always sends it). A rule that only held for one of the two
+// would be a gap dressed as coverage.
 let fail = 0;
+let count = 0;
 for (const [label, command, want] of cases) {
+  for (const [suffix, payload] of [
+    ['', { tool_input: { command } }],
+    [' [+tool_name]', { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } }],
+  ]) {
+    const r = spawnSync(process.execPath, [HOOK], { input: JSON.stringify(payload), encoding: 'utf8' });
+    const got = r.status === 0 ? 'ALLOW' : 'BLOCK';
+    const ok = got === want;
+    count++;
+    if (!ok) fail++;
+    console.log(`${ok ? 'ok  ' : 'FAIL'}  got=${got} want=${want}  ${label}${suffix}`);
+  }
+}
+for (const [label, tool_name, tool_input, want] of mcpCases) {
   const r = spawnSync(process.execPath, [HOOK], {
-    input: JSON.stringify({ tool_input: { command } }), encoding: 'utf8',
+    input: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name, tool_input }), encoding: 'utf8',
   });
   const got = r.status === 0 ? 'ALLOW' : 'BLOCK';
   const ok = got === want;
+  count++;
   if (!ok) fail++;
-  console.log(`${ok ? 'ok  ' : 'FAIL'}  got=${got} want=${want}  ${label}`);
+  console.log(`${ok ? 'ok  ' : 'FAIL'}  got=${got} want=${want}  MCP ${label}`);
 }
-console.log(fail === 0 ? `\nALL PASS (${cases.length} cases)` : `\n${fail} FAILURE(S) of ${cases.length}`);
+
+// ---- DRIFT GATE ---------------------------------------------------------
+// The classifier is duplicated into both guards on purpose (self-containment:
+// a failed `require` exits non-2, which Claude Code treats as a NON-blocking
+// error — i.e. fail open — so a shared file is a single point of disarmament).
+// Duplication is only safe if drift is detected, so assert the copies match.
+// ⚠️ THREE outcomes, not two. codex-review-guard.js is LIVE-ONLY BY DESIGN — it
+// is deliberately not published to the public mirror. A plain pass/fail gate
+// therefore turned the public repo's suite RED for a file that is *supposed* to
+// be absent: an instrument fault wearing a defect's clothes, and on the one
+// artifact strangers verify by running it. So absence is N/A (announced, never
+// silent), while a present-but-different copy is a real FAIL.
+const fs = require('fs');
+const COUNTERPART = require('path').join(__dirname, 'codex-review-guard.js');
+const grab = (f) => {
+  const src = fs.readFileSync(require('path').join(__dirname, f), 'utf8');
+  const m = src.match(/const FORGE_SERVER = [\s\S]*?^}/m);
+  if (!m) throw new Error(`classifier block not found in ${f} — the gate cannot measure`);
+  return m[0];
+};
+if (!fs.existsSync(COUNTERPART)) {
+  console.log('n/a   classifier drift gate — codex-review-guard.js is not in this checkout ' +
+    '(expected in the public mirror, where it is live-only by design; NOT a pass)');
+} else {
+  let driftOk;
+  try {
+    driftOk = grab('block-dangerous-git.js') === grab('codex-review-guard.js');
+  } catch (e) {
+    driftOk = false;
+    console.log('FAIL  drift gate could not run: ' + e.message);
+  }
+  count++;
+  if (!driftOk) fail++;
+  console.log(`${driftOk ? 'ok  ' : 'FAIL'}  classifier identical in both guards (no drift)`);
+}
+
+console.log(fail === 0 ? `\nALL PASS (${count} cases)` : `\n${fail} FAILURE(S) of ${count}`);
 process.exit(fail === 0 ? 0 : 1);
